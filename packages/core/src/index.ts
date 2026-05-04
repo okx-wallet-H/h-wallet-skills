@@ -8,6 +8,10 @@
 export { RestClient } from "./client/rest-client.js";
 export type { HWalletConfig, OkxResponse } from "./client/rest-client.js";
 
+// Onchain OS Client (V6)
+export { OnchainClient } from "./client/onchainos-client.js";
+export type { OnchainResult, OnchainClientOptions } from "./client/onchainos-client.js";
+
 // Config
 export { resolveConfig, readFullConfig, writeFullConfig, configFilePath } from "./config/config.js";
 export type { HWalletProfile, HWalletTomlConfig } from "./config/config.js";
