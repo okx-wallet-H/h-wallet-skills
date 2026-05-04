@@ -1,0 +1,19 @@
+{
+  "name": "h-wallet-skills",
+  "version": "1.0.0",
+  "private": true,
+  "description": "H Wallet AI Agent Skills - OKX V5 CEX perpetual swap trading",
+  "type": "module",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  },
+  "keywords": ["okx", "trading", "perpetual", "swap", "crypto", "ai-agent", "mcp"],
+  "author": "h-wallet",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=9"
+  }
+}

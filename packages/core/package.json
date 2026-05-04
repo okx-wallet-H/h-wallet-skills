@@ -1,0 +1,36 @@
+{
+  "name": "@h-wallet/core",
+  "version": "1.0.0",
+  "description": "H Wallet core library - OKX V5 API client with HMAC-SHA256 signing",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test"
+  },
+  "keywords": [
+    "okx",
+    "trading",
+    "perpetual",
+    "swap",
+    "crypto",
+    "h-wallet"
+  ],
+  "author": "h-wallet",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^5.4.0"
+  }
+}
