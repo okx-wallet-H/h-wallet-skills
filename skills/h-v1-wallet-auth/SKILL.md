@@ -138,6 +138,9 @@ If user has no credentials configured:
 |---|---|---|---|
 | 13 | `h-wallet account transfer` | WRITE | Transfer between accounts (funding ↔ trading) |
 | 14 | `h-wallet account bills` | READ | Account bills / transaction history |
+| 15 | `h-wallet account deposit-address` | READ | Get CEX deposit address |
+| 16 | `h-wallet account withdraw` | WRITE | Withdraw from CEX to Onchain |
+| 17 | `h-wallet account withdraw-status` | READ | Check withdrawal status |
 
 ## CLI Command Reference
 
