@@ -24,7 +24,7 @@ export interface HWalletConfig {
   sourceTag: string;
 }
 
-export interface OkxResponse<T = unknown> {
+export interface OkxResponse<T = any> {
   code: string;
   msg: string;
   data: T;
@@ -53,7 +53,7 @@ export class RestClient {
    * Public GET request (no authentication required).
    * Used for market data endpoints.
    */
-  async publicGet<T = unknown>(
+  async publicGet<T = any>(
     path: string,
     query?: Record<string, string | number | undefined>
   ): Promise<OkxResponse<T>> {
@@ -64,7 +64,7 @@ export class RestClient {
    * Private GET request (authentication required).
    * Used for account data, positions, orders.
    */
-  async privateGet<T = unknown>(
+  async privateGet<T = any>(
     path: string,
     query?: Record<string, string | number | undefined>
   ): Promise<OkxResponse<T>> {
@@ -75,7 +75,7 @@ export class RestClient {
    * Private POST request (authentication required).
    * Used for placing orders, creating bots, fund transfers.
    */
-  async privatePost<T = unknown>(
+  async privatePost<T = any>(
     path: string,
     body?: Record<string, unknown>
   ): Promise<OkxResponse<T>> {
