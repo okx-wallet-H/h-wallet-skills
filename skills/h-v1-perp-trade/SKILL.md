@@ -1,6 +1,6 @@
 ---
 name: h-v1-perp-trade
-description: "Use this skill when the user asks to 'open long', 'open short', 'close position', 'place order', 'limit order', 'market order', 'cancel order', 'set TP/SL', 'take profit', 'stop loss', 'trailing stop', 'set leverage', 'amend order', 'check orders', 'fill history', '开多', '开空', '平仓', '下单', '限价单', '市价单', '撤单', '止盈', '止损', '追踪止损', '设置杠杆', '修改订单', '查看订单', '成交记录', '一键平仓', or any request to place, cancel, amend perpetual swap orders, set TP/SL, adjust leverage, or manage positions on H Wallet. Requires API credentials. Do NOT use for market data (h-v1-perp-market), smart money signals (h-v1-perp-signal), account balance (h-v1-wallet-auth), or bots (h-v1-perp-grid / h-v1-perp-dca)."
+description: "Use this skill when the user asks to 'open long', 'open short', 'close position', 'place order', 'limit order', 'market order', 'cancel order', 'set TP/SL', 'take profit', 'stop loss', 'trailing stop', 'set leverage', 'amend order', 'check orders', 'fill history', 'get leverage', 'positions', '开多', '开空', '平仓', '下单', '限价单', '市价单', '撤单', '止盈', '止损', '追踪止损', '设置杠杆', '查看杠杆', '修改订单', '查看订单', '成交记录', '一键平仓', '持仓', or any request to place, cancel, amend perpetual swap orders, set TP/SL, adjust leverage, or manage positions on H Wallet. Covers perpetual swap (USDT-M and coin-M) order management, algo orders (TP/SL/trailing), leverage, and position operations. Requires API credentials. Do NOT use for market data (h-v1-perp-market), smart money signals (h-v1-perp-signal), account balance (h-v1-wallet-auth), or bots (h-v1-perp-grid / h-v1-perp-dca)."
 license: MIT
 metadata:
   author: h-wallet
@@ -19,222 +19,345 @@ metadata:
 
 # H Wallet 永续合约交易执行
 
-永续合约的开仓、平仓、止盈止损、杠杆调整和订单管理。**需要 API 凭证。**
+Perpetual swap (USDT-margined and coin-margined) order management on H Wallet. Place, cancel, amend, and monitor orders; set take-profit/stop-loss and trailing stops; manage leverage and positions. **Requires API credentials.**
+
+> **CLI vs MCP tool names** — Subcommands use spaces (`h-wallet swap algo place`, `h-wallet swap close`), not hyphens. Do NOT convert an MCP tool identifier (`swap_place_algo_order`) into a hyphen-joined CLI command — that will be rejected with "Unknown command". Per-command mapping tables live in `references/swap-commands.md`.
 
 ## Preflight
 
 Before running any command, follow [`../_shared/preflight.md`](../_shared/preflight.md).
-Use `metadata.version` from this file's frontmatter as the reference for version check.
+Use `metadata.version` from this file's frontmatter as the reference for Step 2.
 
----
+## Prerequisites
+
+1. Install `h-wallet` CLI:
+   ```bash
+   npm install -g @h-wallet/trade-cli
+   ```
+2. Configure credentials:
+   ```bash
+   h-wallet config init   # follow interactive setup
+   ```
+3. Test with demo mode (simulated trading, no real funds):
+   ```bash
+   h-wallet --demo swap orders
+   ```
+
+> **Security**: NEVER accept credentials in chat. Guide users to `h-wallet config init` for setup.
+
+## Credential & Profile Check
+
+**Run this check before any authenticated command.** The auth method is detected during [preflight](../_shared/preflight.md) Step 2 and remembered for the session.
+
+### Step A — Verify credentials
+
+Run **both** commands:
+
+```bash
+h-wallet config show --json      # reveals API-key profiles (TOML config)
+h-wallet auth status --json      # reveals OAuth session state
+```
+
+Apply **in this order** — first match wins:
+
+- `config show --json` has any profile with a non-empty `api_key` field → **API Key mode**. Proceed to Step B.
+- No API-key profile **AND** `auth status --json` returns `"status":"logged_in"` → **OAuth mode**. Proceed to Step B.
+- No API-key profile **AND** `"status":"pending"` — login is in progress, wait for it to complete.
+- No API-key profile **AND** `"status":"not_logged_in"` — **stop all operations**, load `h-v1-wallet-auth` skill and follow login steps, wait for completion.
+
+### Step B — Confirm trading mode
+
+**Resolution rules:**
+1. Current message intent is clear (e.g. "real" / "实盘" / "live" → live; "test" / "模拟" / "demo" → demo) → use it and inform the user
+2. Current message has no explicit declaration → check conversation context for a previous choice:
+   - Found → reuse it, inform user
+   - Not found → ask: `"Live (实盘) or Demo (模拟盘)?"` — wait for answer before proceeding
+
+**How to apply the mode depends on auth method (detected in Step A):**
+
+| Auth method | Live (实盘) | Demo (模拟盘) |
+|---|---|---|
+| **API Key** | `--profile <live-profile>` | `--profile <demo-profile>` |
+| **OAuth** | *(no flag needed, live is default)* | `--demo` |
+
+- **API Key users**: run `h-wallet config show --json` to discover available profile names and their `demo` settings. Use `--profile <name>` to select the correct one.
+- **OAuth users**: omit flags for live trading; add `--demo` for simulated trading. Do **not** use `--profile` to switch modes.
+
+### Handling Authentication Errors
+
+**Authentication error** (error contains "401", "Session expired", or "Run `h-wallet auth login` first"):
+1. **Stop immediately** — do not retry the same command
+2. Inform the user: "Authentication failed. Your session may have expired."
+3. Load `h-v1-wallet-auth` skill and follow the re-authentication steps
+4. After successful re-authentication, retry the original command
+
+## Demo vs Live Mode
+
+| Mode | Funds | API Key param | OAuth param |
+|---|---|---|---|
+| 实盘 (live) | Real money — irreversible | `--profile <live-profile>` | *(default, no flag)* |
+| 模拟盘 (demo) | Simulated — no real funds | `--profile <demo-profile>` | `--demo` |
+
+**Rules:**
+1. Trading mode is **required** on every authenticated command — determined in "Credential & Profile Check" Step B
+2. Every response after a command must append: `[mode: live]` or `[mode: demo]`
 
 ## Skill Routing
 
 | User intent | Route to skill |
 |---|---|
-| Account balance, margin, transfers | `h-v1-wallet-auth` |
-| Market data, prices, candles, funding rate | `h-v1-perp-market` |
-| Smart money, trader signals | `h-v1-perp-signal` |
+| Market data, prices, candles, funding rate, OI | `h-v1-perp-market` |
+| Account balance, margin, transfers, position mode | `h-v1-wallet-auth` |
+| Smart money, trader signals, consensus | `h-v1-perp-signal` |
 | Grid bot strategy | `h-v1-perp-grid` |
 | DCA / Martingale strategy | `h-v1-perp-dca` |
-| Place / cancel / amend orders, TP/SL, leverage | **This skill** |
+| Place / cancel / amend orders, TP/SL, leverage, positions | **This skill** |
 
----
+## Sz Handling for Perpetual Swaps
 
-## Command Index (9 commands)
+### CRITICAL: Always verify contract face value before placing orders
 
-### Order Management
+Before placing any SWAP order, call `h-v1-perp-market` → `market instruments --instType SWAP --instId <id>` to get `ctVal` (contract face value). **Do NOT assume contract sizes** — they vary by instrument (e.g. ETH-USDT-SWAP = 0.1 ETH/contract, BTC-USDT-SWAP = 0.01 BTC/contract).
 
-| Command | Type | Auth | Description |
+Use `ctVal` to:
+- Calculate the correct number of contracts from user's intended position size
+- Verify margin requirements before submitting the order
+- Show the user the actual position value: `sz × ctVal × price`
+
+### Three tgtCcy modes for USDT-denominated sizing
+
+| `--tgtCcy` | sz meaning | Conversion formula | Example: "500U" at 10x lever |
 |---|---|---|---|
-| `trade place` | WRITE | Required | Place a new perpetual swap order |
-| `trade cancel` | WRITE | Required | Cancel a pending order |
-| `trade amend` | WRITE | Required | Amend an existing order (price/size) |
-| `trade close` | WRITE | Required | Close a position (market or limit) |
-| `trade close-all` | WRITE | Required | Emergency close all positions |
+| `base_ccy` (default) | contract count | no conversion | 500 contracts |
+| `quote_ccy` | USDT notional value | `floor(sz / (ctVal * lastPx))` | 500 USDT notional |
+| `margin` | USDT margin cost | `floor(sz * lever / (ctVal * lastPx))` | 500 USDT margin = 5000 USDT notional |
 
-### Algo Orders (TP/SL/Trailing)
+### Ambiguity Resolution
 
-| Command | Type | Auth | Description |
-|---|---|---|---|
-| `trade algo` | WRITE | Required | Place algo order (TP/SL/trailing stop) |
-| `trade cancel-algo` | WRITE | Required | Cancel an algo order |
+**When user specifies a USDT amount** (e.g. "200U", "500 USDT", "$1000"):
+→ **AMBIGUOUS** — this could mean notional value OR margin cost.
+  You MUST ask the user to clarify before proceeding:
+  - **notional value (名义价值)**: sz = position value in USDT (e.g. 500 USDT buys 500 USDT worth of contracts directly)
+  - **margin cost (保证金)**: actual position = sz × leverage (e.g. 500 USDT margin at 10× = 5000 USDT notional position)
+  Wait for the user's answer before continuing.
+- If notional value → use `--tgtCcy quote_ccy`
+- If margin cost → use `--tgtCcy margin`
 
-### Query
+**When user specifies contracts** (e.g. "2 张", "5 contracts"):
+→ First verify `ctVal` via `market instruments`, then use `--sz` with the contract count. Confirm with user: "X contracts = X × ctVal underlying, total value ≈ $Y".
 
-| Command | Type | Auth | Description |
-|---|---|---|---|
-| `trade orders` | READ | Required | List pending orders |
-| `trade fills` | READ | Required | Recent fill/trade history |
+**When user gives a plain number with no unit** (for swap):
+→ **AMBIGUOUS** — You MUST ask the user to clarify before proceeding:
+  - **contract count (张数)**: X contracts (each worth ctVal of underlying)
+  - **USDT notional value (名义价值)**: position value in USDT
+  - **USDT margin cost (保证金)**: margin amount (actual position = X × leverage)
+  Wait for the user's answer before continuing.
 
----
+⚠ **Inverse contracts** (`*-USD-SWAP`): `tgtCcy=quote_ccy` and `tgtCcy=margin` also work (note: `quote_ccy` = USD, not USDT, for inverse instruments). Always warn: "This is an inverse contract (币本位). Margin and P&L are settled in BTC/ETH, not USDT."
 
-## Detailed Command Reference
-
-### trade place — 下单
+## Quickstart
 
 ```bash
-h-wallet trade place --instId <id> --side <buy|sell> --posSide <long|short> --ordType <type> --sz <size> [--px <price>] [--tpTriggerPx <px>] [--tpOrdPx <px>] [--slTriggerPx <px>] [--slOrdPx <px>] [--json]
+# Long 1 contract BTC perp (cross margin)
+h-wallet swap place --instId BTC-USDT-SWAP --side buy --ordType market --sz 1 \
+  --tdMode cross --posSide long
+
+# Long 1000 USDT notional value of BTC perp (auto-convert to contracts)
+h-wallet swap place --instId BTC-USDT-SWAP --side buy --ordType market --sz 1000 \
+  --tgtCcy quote_ccy --tdMode cross --posSide long
+
+# Long with 500 USDT margin at current leverage (e.g. 10x → 5000 USDT notional)
+h-wallet swap place --instId BTC-USDT-SWAP --side buy --ordType market --sz 500 \
+  --tgtCcy margin --tdMode cross --posSide long
+
+# Long 1 contract with attached TP/SL (one step)
+h-wallet swap place --instId BTC-USDT-SWAP --side buy --ordType market --sz 1 \
+  --tdMode cross --posSide long \
+  --tpTriggerPx 105000 --tpOrdPx=-1 --slTriggerPx 88000 --slOrdPx=-1
+
+# Close BTC perp long position entirely at market
+h-wallet swap close --instId BTC-USDT-SWAP --mgnMode cross --posSide long
+
+# Set 10x leverage on BTC perp (cross)
+h-wallet swap leverage --instId BTC-USDT-SWAP --lever 10 --mgnMode cross
+
+# Place trailing stop on BTC perp long (callback 2%)
+h-wallet swap algo trail --instId BTC-USDT-SWAP --side sell --sz 1 \
+  --tdMode cross --posSide long --callbackRatio 0.02
+
+# View open swap positions
+h-wallet swap positions
+
+# Cancel a swap order
+h-wallet swap cancel --instId BTC-USDT-SWAP --ordId <ordId>
+
+# Emergency close all positions
+h-wallet swap close-all
 ```
 
-#### Parameters
+## Command Index
 
-| Param | Required | Default | Description |
+### Swap / Perpetual Orders (15 commands)
+
+| # | Command | Type | Description |
 |---|---|---|---|
-| `--instId` | Yes | — | Instrument ID (e.g. `ETH-USDT-SWAP`) |
-| `--side` | Yes | — | Order side: `buy` / `sell` |
-| `--posSide` | Yes* | — | Position side: `long` / `short` (required in long/short mode) |
-| `--ordType` | Yes | — | Order type: `market` / `limit` / `post_only` / `fok` / `ioc` |
-| `--sz` | Yes | — | Size in contracts |
-| `--px` | Cond. | — | Price (required for limit orders) |
-| `--tpTriggerPx` | No | — | Take profit trigger price |
-| `--tpOrdPx` | No | — | Take profit order price (`-1` for market) |
-| `--slTriggerPx` | No | — | Stop loss trigger price |
-| `--slOrdPx` | No | — | Stop loss order price (`-1` for market) |
+| 1 | `h-wallet swap place` | WRITE | Place perpetual swap order |
+| 2 | `h-wallet swap cancel` | WRITE | Cancel swap order |
+| 3 | `h-wallet swap amend` | WRITE | Amend swap order price or size |
+| 4 | `h-wallet swap close` | WRITE | Close entire position at market |
+| 5 | `h-wallet swap close-all` | WRITE | Emergency close ALL positions |
+| 6 | `h-wallet swap leverage` | WRITE | Set leverage for an instrument |
+| 7 | `h-wallet swap algo place` | WRITE | Place swap TP/SL algo order |
+| 8 | `h-wallet swap algo trail` | WRITE | Place swap trailing stop order |
+| 9 | `h-wallet swap algo amend` | WRITE | Amend swap algo order |
+| 10 | `h-wallet swap algo cancel` | WRITE | Cancel swap algo order |
+| 11 | `h-wallet swap positions` | READ | Open perpetual swap positions |
+| 12 | `h-wallet swap orders` | READ | List open or historical swap orders |
+| 13 | `h-wallet swap get` | READ | Single swap order details |
+| 14 | `h-wallet swap fills` | READ | Swap trade fill history |
+| 15 | `h-wallet swap get-leverage` | READ | Current leverage settings |
+| 16 | `h-wallet swap algo orders` | READ | List swap algo orders |
 
-> *`posSide` is required when account is in `long_short_mode`. In `net_mode`, omit it.
-
-#### Order Side Logic (long/short mode)
-
-| Intent | side | posSide |
-|---|---|---|
-| Open long | `buy` | `long` |
-| Close long | `sell` | `long` |
-| Open short | `sell` | `short` |
-| Close short | `buy` | `short` |
-
-#### Response Fields
-
-| Field | Type | Description |
-|---|---|---|
-| `ordId` | String | Order ID |
-| `clOrdId` | String | Client order ID |
-| `sCode` | String | Status code (`0` = success) |
-| `sMsg` | String | Status message |
-
----
-
-### trade close — 平仓
-
-```bash
-h-wallet trade close --instId <id> --posSide <long|short> [--sz <size>] [--ordType <type>] [--px <price>] [--json]
-```
-
-| Param | Required | Default | Description |
-|---|---|---|---|
-| `--instId` | Yes | — | Instrument ID |
-| `--posSide` | Yes | — | Position side to close: `long` / `short` |
-| `--sz` | No | all | Size to close (omit = close all) |
-| `--ordType` | No | `market` | Order type for closing |
-| `--px` | Cond. | — | Price (required if ordType = limit) |
-
----
-
-### trade close-all — 一键平仓
-
-```bash
-h-wallet trade close-all [--instId <id>] [--json]
-```
-
-| Param | Required | Default | Description |
-|---|---|---|---|
-| `--instId` | No | all | Specific instrument (omit = close ALL positions) |
-
-> **⚠️ DANGER**: This command closes all open positions at market price. Always require user confirmation.
-
----
-
-### trade algo — 止盈止损 / 追踪止损
-
-```bash
-h-wallet trade algo --instId <id> --side <buy|sell> --posSide <long|short> --sz <size> --ordType <type> [--tpTriggerPx <px>] [--tpOrdPx <px>] [--slTriggerPx <px>] [--slOrdPx <px>] [--callbackRatio <r>] [--json]
-```
-
-#### Algo Order Types
-
-| ordType | Description | Required Params |
-|---|---|---|
-| `conditional` | TP/SL conditional order | `tpTriggerPx` and/or `slTriggerPx` |
-| `oco` | One-cancels-other (TP + SL) | Both `tpTriggerPx` and `slTriggerPx` |
-| `trigger` | Trigger order | `triggerPx` |
-| `move_order_stop` | Trailing stop | `callbackRatio` (e.g. `0.05` = 5%) |
-
----
-
-### trade orders — 查看挂单
-
-```bash
-h-wallet trade orders [--instId <id>] [--ordType <type>] [--state <state>] [--limit <n>] [--json]
-```
-
-| Param | Required | Default | Description |
-|---|---|---|---|
-| `--instId` | No | all | Filter by instrument |
-| `--ordType` | No | all | Filter by order type |
-| `--state` | No | `live` | Order state: `live` / `partially_filled` |
-| `--limit` | No | `20` | Max results |
-
----
-
-### trade fills — 成交记录
-
-```bash
-h-wallet trade fills [--instId <id>] [--ordId <id>] [--limit <n>] [--json]
-```
-
-| Param | Required | Default | Description |
-|---|---|---|---|
-| `--instId` | No | all | Filter by instrument |
-| `--ordId` | No | — | Filter by specific order ID |
-| `--limit` | No | `20` | Max results |
-
----
+For full command syntax, parameter tables, and edge cases, read `{baseDir}/references/swap-commands.md`.
 
 ## Operation Flow
 
 ### Step 0 — Credential & Profile Check
 
-Before any command: run `h-wallet config show --json`. Always use `--profile live` silently.
+Before any authenticated command: see [Credential & Profile Check](#credential--profile-check). Determine auth method and trading mode before executing.
 
-### Step 1 — Identify intent
+After every command result: append `[mode: live]` or `[mode: demo]`.
 
-| User says | Command |
-|---|---|
-| "开多 ETH 10张" | `trade place --instId ETH-USDT-SWAP --side buy --posSide long --ordType market --sz 10` |
-| "开空 BTC 限价 95000" | `trade place --instId BTC-USDT-SWAP --side sell --posSide short --ordType limit --sz 1 --px 95000` |
-| "平多仓" | `trade close --instId ETH-USDT-SWAP --posSide long` |
-| "设止盈 100000" | `trade algo --instId BTC-USDT-SWAP ... --tpTriggerPx 100000 --tpOrdPx -1` |
-| "一键平仓" | `trade close-all` |
-| "查看挂单" | `trade orders` |
+### Step 1 — Identify instrument type and action
 
-### Step 2 — Confirmation & Execute
+**Swap/Perpetual** (instId format: `BTC-USDT-SWAP`, `ETH-USD-SWAP`):
+- Place/cancel/amend order → `h-wallet swap place/cancel/amend`
+- Close position → `h-wallet swap close`
+- Close all positions → `h-wallet swap close-all`
+- Leverage → `h-wallet swap leverage` / `h-wallet swap get-leverage`
+- TP/SL conditional → `h-wallet swap algo place/amend/cancel`
+- Trailing stop → `h-wallet swap algo trail`
+- Query → `h-wallet swap positions/orders/get/fills/get-leverage/algo orders`
 
-- **READ commands**: no confirmation needed.
-- **WRITE commands**: **MUST require user confirmation** before execution. Display order summary:
-  - Instrument, direction, size, price, leverage
-  - Estimated margin required
-  - Risk warning if leverage > 20x
+### Step 2 — Confirm profile, then confirm write parameters
 
----
+**Read commands** (orders, positions, fills, get, get-leverage, algo orders): run immediately.
+
+- `--history` flag: defaults to active/open; use `--history` only if user explicitly asks for history
+- `--ordType` for algo: `conditional` = single TP or SL; `oco` = both TP and SL together
+- `--tdMode` for swap: `cross` or `isolated`
+- `--posSide` for hedge mode: `long` or `short`; omit in net mode
+
+**Write commands** (place, cancel, amend, close, close-all, leverage, algo): confirm the key order details once before executing:
+- Swap place: confirm `--instId`, `--side`, `--sz`, `--tdMode`, and **explicitly confirm order mode** when user specifies a USDT amount: `--tgtCcy quote_ccy` (notional value, sz = position value) or `--tgtCcy margin` (margin cost, actual position = sz * leverage). Always state which mode is being used.
+- Swap close: confirm `--instId`, `--mgnMode`, `--posSide`
+- Swap close-all: **MUST** display explicit warning that ALL positions will be closed. Require double confirmation.
+- Leverage: confirm new leverage and impact on existing positions. **Pre-checks to avoid common 400s**: (a) `--lever` must be a positive number within the instrument's max (see `h-v1-perp-market` → `market instruments` → `lever`); (b) for `--mgnMode isolated` in hedge pos mode, `--posSide` is required — each side (`long`, `short`) must be set **separately**, setting one does NOT auto-apply to the other; (c) **portfolio-margin accounts cannot adjust `cross` leverage for SWAP** — exchange will reject; if unsure, run `h-wallet account config` and check `acctLv` first.
+- Algo place: confirm `--instId`, `--side`, `--posSide`, `--sz`, `--ordType`, and TP/SL prices or callback ratio
+- Algo trail: confirm `--callbackRatio` (e.g., `0.02` = 2%) or `--callbackSpread`
+
+For full parameter details per command, read the relevant reference file.
+
+### Error-suggested remediation safeguard
+
+When an API error message suggests a fix that involves **write operations** (cancel orders, close positions, stop bots/strategies, transfer funds, etc.), you **MUST NOT** automatically execute those actions. Instead:
+
+1. **Report** the error and its suggestion to the user verbatim
+2. **Diagnose** — run read-only queries to identify what is blocking (e.g., `algo orders --status pending`, `positions`, `h-v1-perp-grid` → `grid list --status active`)
+3. **Present findings** — show the user what was found and which specific items would need to be cancelled/closed/stopped
+4. **Wait for explicit confirmation** before executing any remediation
+
+This applies to all error codes whose messages suggest destructive actions, including but not limited to:
+- Set-leverage blocked by pending algo orders or active bots
+- Account setting changes requiring order/position/strategy cleanup
+- Margin mode switches requiring position closure
+- Any error containing phrases like "cancel", "close", "stop", "transfer … before"
+
+**Rationale:** Error messages list _all possible_ blockers generically — the actual blocker is often just one item (e.g., a single TP/SL order). Blindly following the error text can cause unnecessary position closures or bot shutdowns that the user did not intend.
+
+### Step 3 — Verify after writes
+
+- After `swap place`: run `h-wallet swap orders` to confirm order is live or `h-wallet swap fills` if market order
+- After `swap close`: run `h-wallet swap positions` to confirm position size is 0
+- After `swap close-all`: run `h-wallet swap positions` to confirm all positions are 0
+- After swap algo place/trail: run `h-wallet swap algo orders` to confirm algo is active
+- After cancel: run `h-wallet swap orders` to confirm order is gone
+- After leverage change: run `h-wallet swap get-leverage` to confirm new setting
+
+## Cross-Skill Workflows
+
+### Open Long with TP/SL
+> User: "开多 BTC 500U 保证金，10倍杠杆，止盈 105000，止损 88000"
+
+```
+1. h-v1-perp-market    h-wallet market ticker BTC-USDT-SWAP          → confirm current price
+2. h-v1-perp-market    h-wallet market instruments --instId BTC-USDT-SWAP → get ctVal
+3. h-v1-wallet-auth    h-wallet account balance USDT                  → confirm available margin ≥ 500
+4. h-v1-perp-trade     h-wallet swap get-leverage --instId BTC-USDT-SWAP --mgnMode cross → confirm lever = 10
+        ↓ user confirms parameters
+5. h-v1-perp-trade     h-wallet swap place --instId BTC-USDT-SWAP --side buy --ordType market \
+                         --sz 500 --tgtCcy margin --tdMode cross --posSide long \
+                         --tpTriggerPx 105000 --tpOrdPx=-1 --slTriggerPx 88000 --slOrdPx=-1
+6. h-v1-perp-trade     h-wallet swap positions BTC-USDT-SWAP          → verify position opened
+7. h-v1-perp-trade     h-wallet swap algo orders --instId BTC-USDT-SWAP → verify TP/SL active
+```
+
+### Adjust Leverage with Error Handling
+> User: "把 ETH 合约杠杆调到 20 倍"
+
+```
+1. h-v1-perp-trade     h-wallet swap get-leverage --instId ETH-USDT-SWAP --mgnMode cross → current lever
+2. h-v1-perp-trade     h-wallet swap leverage --instId ETH-USDT-SWAP --lever 20 --mgnMode cross
+        ↓ if error "cancel pending algo orders or stop bots":
+3. h-v1-perp-trade     h-wallet swap algo orders --instId ETH-USDT-SWAP → find blockers
+4. h-v1-perp-grid      h-wallet grid list --instId ETH-USDT-SWAP       → check active bots
+        ↓ report findings to user, wait for confirmation
+5. h-v1-perp-trade     h-wallet swap algo cancel --instId ETH-USDT-SWAP --algoId <id> → cancel if approved
+6. h-v1-perp-trade     h-wallet swap leverage --instId ETH-USDT-SWAP --lever 20 --mgnMode cross → retry
+7. h-v1-perp-trade     h-wallet swap get-leverage --instId ETH-USDT-SWAP --mgnMode cross → verify
+```
+
+### Trailing Stop on Existing Position
+> User: "给我的 BTC 多仓加个 2% 追踪止损"
+
+```
+1. h-v1-perp-trade     h-wallet swap positions BTC-USDT-SWAP           → get position size
+2. h-v1-perp-trade     h-wallet swap algo trail --instId BTC-USDT-SWAP --side sell --sz <position_sz> \
+                         --tdMode cross --posSide long --callbackRatio 0.02
+3. h-v1-perp-trade     h-wallet swap algo orders --instId BTC-USDT-SWAP → verify trailing stop active
+```
 
 ## Safety Rules
 
-1. **杠杆警告**：杠杆 > 20x 时，必须显示高风险警告。
-2. **大额订单确认**：订单金额 > 1000 USDT 时，要求二次确认。
-3. **一键平仓保护**：`trade close-all` 命令必须明确告知用户将平掉所有仓位。
-4. **止盈默认**：建议用户在开仓时同时设置 30% 止盈。
+1. **杠杆警告**：杠杆 > 20x 时，必须显示高风险警告并要求确认。
+2. **大额订单确认**：订单名义价值 > 5000 USDT 时，要求二次确认。
+3. **一键平仓保护**：`swap close-all` 命令必须明确告知用户将平掉所有仓位，要求双重确认。
+4. **止盈默认建议**：建议用户在开仓时同时设置 30% 止盈。
+5. **逆向合约警告**：使用 `*-USD-SWAP` 时，必须提醒用户保证金和盈亏以币结算。
+6. **错误不自动修复**：API 错误建议的修复操作（撤单、平仓、停止策略）不得自动执行。
 
----
+## Edge Cases — Swap / Perpetual
 
-## MCP Tool Reference
+- **sz unit**: number of contracts (default), USDT notional value (`--tgtCcy quote_ccy`), or USDT margin cost (`--tgtCcy margin`). If the user specifies a USDT amount, clarify whether it is notional value or margin cost, then pass directly as `--sz` with the appropriate `--tgtCcy` — do NOT manually convert to contracts. With `margin` mode, the system queries current leverage and calculates: `contracts = floor(margin * lever / (ctVal * lastPx))`
+- **Linear vs inverse**: `BTC-USDT-SWAP` is linear (USDT-margined); `BTC-USD-SWAP` is inverse (BTC-margined). For inverse, warn the user that margin and P&L are settled in BTC
+- **posSide**: required in hedge mode (`long_short_mode`); omit in net mode. Check `h-wallet account config` for `posMode`
+- **tdMode**: use `cross` for cross-margin, `isolated` for isolated margin
+- **Close position**: `swap close` closes the **entire** position; to partial close, use `swap place` with `--reduceOnly`
+- **Close-all**: closes ALL positions across ALL instruments at market — use with extreme caution
+- **Leverage**: max leverage varies by instrument and account level; exchange rejects if exceeded. **If set-leverage fails with "Cancel cross-margin TP/SL … or stop bots"**: troubleshoot in order: (1) `h-wallet swap algo orders --instId <id>` — check for TP/SL, trailing, trigger orders (most common cause); (2) only if no algo orders found, check bots: `h-wallet grid list --instId <id>`. **Never automatically cancel algo orders or stop bots** — show findings to the user and let them decide
+- **Trailing stop**: use either `--callbackRatio` (relative, e.g., `0.02`) or `--callbackSpread` (absolute price), not both
+- **Algo on close side**: always set `--side` opposite to position (e.g., long position → sell algo)
+- **Position mode detection**: run `h-wallet account config` to check `posMode` — `long_short_mode` requires `--posSide`; `net_mode` does not
+- **Rate limit**: 60 order operations per 2 seconds per UID
+- **Network errors**: If commands fail with a connection error, prompt user to check network: `curl -I https://www.okx.com`
 
-| CLI Command | MCP Tool | OKX API Endpoint |
-|---|---|---|
-| `trade place` | `swap_place_order` | `POST /api/v5/trade/order` |
-| `trade cancel` | `swap_cancel_order` | `POST /api/v5/trade/cancel-order` |
-| `trade amend` | `swap_amend_order` | `POST /api/v5/trade/amend-order` |
-| `trade close` | `swap_close_position` | `POST /api/v5/trade/close-position` |
-| `trade algo` | `swap_place_algo` | `POST /api/v5/trade/order-algo` |
-| `trade cancel-algo` | `swap_cancel_algo` | `POST /api/v5/trade/cancel-algos` |
-| `trade orders` | `swap_get_orders` | `GET /api/v5/trade/orders-pending` |
-| `trade fills` | `swap_get_fills` | `GET /api/v5/trade/fills` |
+## Global Notes
+
+- All write commands require valid credentials (OAuth session or API key in `~/.h-wallet/config.toml`)
+- Auth method and trading mode are determined in "Credential & Profile Check"; see that section for parameter rules
+- `--json` returns the raw OKX API v5 response by default. Add `--env` to wrap the output as `{"env": "<live|demo>", "profile": "<name>", "data": <response>}` — useful when you need to know the active environment and credential profile
+- Batch operations (batch cancel, batch amend) are available via MCP tools directly if needed
+- Position mode (`net` vs `long_short_mode`) affects whether `--posSide` is required
+- **Capability discovery**: Run `h-wallet list-tools --json` to get a machine-readable JSON listing of all CLI commands, tool names, and parameters
+
+For MCP tool reference, output conventions, and order amount safety rules, read `{baseDir}/references/templates.md`.
