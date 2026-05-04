@@ -1,0 +1,22 @@
+{
+  "name": "@h-wallet/mcp-server",
+  "version": "1.0.0",
+  "description": "H Wallet MCP Server - Model Context Protocol server for AI Agent integration",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "h-wallet-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx tsx src/index.ts"
+  },
+  "dependencies": {
+    "@h-wallet/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
+  }
+}
