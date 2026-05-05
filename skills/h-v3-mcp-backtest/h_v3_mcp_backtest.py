@@ -1,7 +1,7 @@
 """
-H_V3 MCP Backtest Server
-==========================
-基于 MCP 协议封装 VectorBT Pro 回测引擎。
+H_V3 MCP Backtest Server - AI 回测验证
+==========================================
+基于 MCP 协议封装 AI 回测验证引擎。
 提供标准化的策略回测、参数优化、绩效分析服务。
 任何 MCP Client 均可无缝调用本服务进行策略验证。
 
@@ -35,7 +35,7 @@ except ImportError:
 # MCP Server 初始化
 # ============================================================
 
-mcp = FastMCP("H_V3 Backtest")
+mcp = FastMCP("H_V3 AI Backtest")
 
 # ============================================================
 # 配置常量
@@ -317,7 +317,7 @@ def run_backtest(
         完整的回测绩效报告，包含收益率、最大回撤、夏普比率、胜率等
     """
     if not VBT_AVAILABLE:
-        return {"error": True, "message": "VectorBT Pro 未安装，无法执行回测"}
+        return {"error": True, "message": "AI 回测验证引擎未就绪"}
 
     # 解析交易对
     symbol_upper = symbol.upper().strip()
@@ -379,7 +379,7 @@ def optimize_params(
         最优参数组合及 TOP 5 结果
     """
     if not VBT_AVAILABLE:
-        return {"error": True, "message": "VectorBT Pro 未安装"}
+        return {"error": True, "message": "AI 回测验证引擎未就绪"}
 
     # 默认搜索范围
     if rsi_buy_range is None:
@@ -590,7 +590,7 @@ def get_backtest_config() -> str:
         "default_days": DEFAULT_DAYS,
         "supported_symbols": list(INSTRUMENT_MAP.keys()),
         "strategy": "RSI + EMA(20/50) + MACD + Hurst Filter",
-        "vectorbt_pro_version": vbt.__version__ if VBT_AVAILABLE else "NOT INSTALLED",
+        "engine_version": vbt.__version__ if VBT_AVAILABLE else "NOT INSTALLED",
     }
     return json.dumps(config, indent=2)
 

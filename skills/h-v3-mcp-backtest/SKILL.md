@@ -1,19 +1,19 @@
-# H_V3 MCP Backtest Server
+# H_V3 MCP AI 回测验证 Server
 
-基于 MCP 协议封装 VectorBT Pro 回测引擎，提供标准化的策略回测、参数优化、绩效分析服务。
+基于 MCP 协议封装 AI 回测验证引擎，提供标准化的策略回测、参数优化、绩效分析服务。
 
 ## 定位
 
-H_V3 引擎链路中的**回测验证环节**：
+H_V3 引擎链路中的**AI 回测验证环节**：
 
 ```
-数据采集 → 指标计算 → 信号生成 → [回测验证] → AI 决策 → 推送执行
+数据采集 → 指标计算 → 信号生成 → [AI 回测验证] → AI 决策 → 推送执行
 ```
 
 ## 依赖
 
 - Python 3.11+
-- vectorbtpro >= 2026.4.x（付费版，需 License）
+- 回测引擎核心库（已部署在 VPS）
 - numpy, pandas
 - mcp SDK
 
@@ -58,7 +58,7 @@ H_V3 引擎链路中的**回测验证环节**：
 
 ### 4. `compare_strategies`
 
-对比多币种在同一策略下的表现，输出排名。
+对比多个币种在同一策略下的表现，找出最佳交易标的。
 
 ## 策略逻辑
 
@@ -94,23 +94,19 @@ best = await client.call_tool("optimize_params", {
 ## 部署
 
 ```bash
-# 确保 VectorBT Pro 已安装
-pip install vectorbtpro
-
 # 作为 MCP Server 运行
 python3.11 h_v3_mcp_backtest.py
 ```
 
 ## 与 H_V3 Bot 集成
 
-Bot 可在以下场景调用回测 Server：
-1. 用户发送 `/backtest BTC` → 调用 `run_backtest`
-2. 定时任务每周自动回测 → 调用 `get_performance`
-3. 用户问"哪个币策略表现最好" → 调用 `compare_strategies`
-4. 参数调优 → 调用 `optimize_params`
+AI 回测验证模块在引擎中的角色：
+1. **信号推送时自动注入** — 引擎发信号 → 自动查询该币种最近的回测绩效 → 一起推送给用户
+2. **定时自动运行** — 每天凌晨更新各币种的策略绩效数据
+3. **策略衰减预警** — 如果回测发现某币种策略夏普降到 0.5 以下，自动降低信号权重
 
 ## 注意事项
 
-- VectorBT Pro 是付费软件，不要将 License Key 提交到公开仓库
 - 回测结果仅供参考，历史表现不代表未来收益
 - 建议定期（每周）重新回测，监控策略衰减
+- 回测引擎核心库为付费软件，不对外暴露
