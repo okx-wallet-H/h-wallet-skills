@@ -63,7 +63,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [Bot] %(levelname)s: %(message)s',
     handlers=[
-        logging.FileHandler('/home/ubuntu/h_v3/bot.log'),
+        logging.FileHandler('/root/h_v3/bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -139,14 +139,48 @@ def format_signal_message(signal: strategy.Signal, bt_result=None) -> str:
         if s.get("rsi"):
             lines.append(f"  RSI: {s['rsi']:.1f}")
         if s.get("supertrend"):
-            lines.append(f"  SuperTrend: {s['supertrend']}")
+            st_icon = "↑" if s['supertrend'] == 'buy' else "↓"
+            lines.append(f"  SuperTrend: {st_icon} {s['supertrend']}")
+        if s.get("ema_5") and s.get("ema_20"):
+            ema_rel = "↑" if s['ema_5'] > s['ema_20'] else "↓"
+            lines.append(f"  EMA: {ema_rel} {s['ema_5']:,.0f}/{s['ema_20']:,.0f}")
         if s.get("funding_rate") is not None:
             fr = s["funding_rate"]
             lines.append(f"  资金费率: {fr*100:.4f}%")
-        if s.get("smart_money"):
-            lines.append(f"  聪明钱: {s['smart_money']}")
         if s.get("long_ratio"):
             lines.append(f"  散户多空: {s['long_ratio']:.0%}/{1-s['long_ratio']:.0%}")
+
+        # 聪明钱三层质量
+        lines.append("")
+        lines.append("─" * 20)
+        lines.append("*聪明钱信号*")
+        if s.get("smart_money"):
+            quality_icon = {
+                "strong": "🟢强共识",
+                "weak": "🟡弱共识",
+                "divergent": "🔴分歧❗",
+            }.get(s.get('sm_quality', ''), '')
+            lines.append(f"  {s['smart_money']} {quality_icon}")
+        if s.get("sm_all_long") is not None:
+            lines.append(f"  全量: {s['sm_all_long']:.0%}多 | 精英: {s.get('sm_elite_long', 0) or 0:.0%}多 | 巨鲸: {s.get('sm_whale_long', 0) or 0:.0%}多")
+        if s.get("sm_long_wr") or s.get("sm_short_wr"):
+            wr_long = f"{s['sm_long_wr']:.0%}" if s.get('sm_long_wr') else 'N/A'
+            wr_short = f"{s['sm_short_wr']:.0%}" if s.get('sm_short_wr') else 'N/A'
+            lines.append(f"  胜率: 多{wr_long} | 空{wr_short}")
+        if s.get("sm_vs24h") is not None or s.get("sm_vs7d") is not None:
+            vs24 = f"{s['sm_vs24h']:+.2f}" if s.get('sm_vs24h') is not None else 'N/A'
+            vs7 = f"{s['sm_vs7d']:+.2f}" if s.get('sm_vs7d') is not None else 'N/A'
+            lines.append(f"  趋势: 24h{vs24} | 7d{vs7}")
+        if s.get("sm_net_notional") is not None:
+            net = s['sm_net_notional']
+            net_str = f"${net/1e6:+.1f}M" if abs(net) >= 1e6 else f"${net/1e3:+.0f}K"
+            lines.append(f"  净资金: {net_str}")
+        if s.get("sm_long_entry") or s.get("sm_short_entry"):
+            le = f"${s['sm_long_entry']:,.0f}" if s.get('sm_long_entry') else 'N/A'
+            se = f"${s['sm_short_entry']:,.0f}" if s.get('sm_short_entry') else 'N/A'
+            lines.append(f"  入场价: 多{le} | 空{se}")
+        if s.get("sm_traders"):
+            lines.append(f"  交易员: {s['sm_traders']}人")
 
     # 回测绩效
     if bt_result:
@@ -159,7 +193,7 @@ def format_signal_message(signal: strategy.Signal, bt_result=None) -> str:
     # 时间戳
     bjt = datetime.now(timezone(timedelta(hours=8)))
     lines.append("")
-    lines.append(f"_{bjt.strftime('%m/%d %H:%M')} BJT | v3.1_")
+    lines.append(f"_{bjt.strftime('%m/%d %H:%M')} BJT | v3.3_")
 
     return "\n".join(lines)
 

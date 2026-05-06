@@ -135,6 +135,16 @@ def empty_standard_data(symbol: str) -> Dict[str, Any]:
         "smart_money_traders_count": None,  # 持仓交易员数
         "smart_money_vs1h": None,
         "smart_money_vs24h": None,
+        "smart_money_vs7d": None,
+        "smart_money_net_notional": None,  # 净名义价值(正=多头主导)
+        "smart_money_total_notional_vs24h": None,  # 24h总资金变化率
+        # 三层信号质量
+        "smart_money_elite_long_pct": None,  # 高质量交易员(WR>=80%+PnL TOP20%)多方占比
+        "smart_money_whale_long_pct": None,  # 大资金(AUM TOP20%)多方占比
+        "smart_money_avg_long_wr": None,  # 多方平均胜率
+        "smart_money_avg_short_wr": None,  # 空方平均胜率
+        "smart_money_quality_consensus": None,  # 三层一致性: strong/weak/divergent
+        "smart_money_quality_score": None,  # 信号质量评分(0-1)
 
         # 多时间框架方向（由多TF指标综合判断）
         "tf_1h": {},
@@ -198,18 +208,43 @@ class OKXRestClient:
             return None
 
     @staticmethod
-    def get_smart_signal(inst_ccy: str) -> Optional[Dict]:
+    def get_smart_signal(inst_ccy: str, **filters) -> Optional[Dict]:
         """
         获取单币种聪明钱共识信号
         API: /api/v5/journal/smartmoney/signal?instCcy=BTC
-        返回: longRatio, shortRatio, weightedLongRatio, vs1h, vs24h, 
-              smartMoneyLongAvgEntry, smartMoneyShortAvgEntry 等
+        
+        可选筛选参数:
+            winRatio: WR_ANY, WR_GE_50, WR_GE_80
+            pnl: PNL_ANY, PNL_TOP50, PNL_TOP20, PNL_TOP5
+            asset: AUM_ANY, AUM_TOP50, AUM_TOP20, AUM_TOP5
+            maxRetreat: MR_ANY, MR_LE_20, MR_LE_50
+            lmtNum: 1-500 (候选池大小)
+        
+        返回: longRatio, weightedLongRatio, avgLongWinRate, avgShortWinRate,
+              vs1h, vs24h, vs7d, netNotionalUsdt, smartMoneyLongAvgEntry 等
         """
-        path = f'/api/v5/journal/smartmoney/signal?instCcy={inst_ccy}'
+        params = f'instCcy={inst_ccy}'
+        for k, v in filters.items():
+            params += f'&{k}={v}'
+        path = f'/api/v5/journal/smartmoney/signal?{params}'
         data = OKXRestClient.api_get(path)
         if data and isinstance(data, list) and len(data) > 0:
             return data[0]
         return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def get_smart_signal_elite(inst_ccy: str) -> Optional[Dict]:
+        """获取高质量交易员信号（胜率>=80% + PnL前20%）"""
+        return OKXRestClient.get_smart_signal(
+            inst_ccy, winRatio='WR_GE_80', pnl='PNL_TOP20', lmtNum='10'
+        )
+
+    @staticmethod
+    def get_smart_signal_whale(inst_ccy: str) -> Optional[Dict]:
+        """获取大资金交易员信号（AUM前20%）"""
+        return OKXRestClient.get_smart_signal(
+            inst_ccy, asset='AUM_TOP20', lmtNum='10'
+        )
 
     @staticmethod
     def get_smart_overview(top_n: int = 20) -> Optional[List]:
@@ -511,14 +546,36 @@ class DataParser:
 # ============================================================
 
 class SmartMoneyAnalyzer:
-    """通过OKX V5 REST API获取聪明钱共识信号"""
+    """
+    通过OKX V5 REST API获取聪明钱共识信号
+    
+    三层信号质量对比：
+    1. 全量信号：所有交易员
+    2. 高质量信号：胜率>=80% + PnL前20%
+    3. 大资金信号：AUM前20%
+    
+    信号质量评估逻辑：
+    - 三层方向一致 = 强共识（高权重）
+    - 高质量与全量不一致 = 低质量共识（散户跟风，降权）
+    - 大资金与全量不一致 = 大资金反向（最危险信号）
+    """
+
+    @staticmethod
+    def _classify_direction(long_pct: Optional[float]) -> str:
+        """根据多方占比判断方向"""
+        if long_pct is None:
+            return "unknown"
+        if long_pct >= 0.55:
+            return "long"
+        elif long_pct <= 0.45:
+            return "short"
+        return "neutral"
 
     @staticmethod
     def analyze(symbol: str = "BTC") -> Dict:
         """
-        获取聪明钱共识信号
-        直接调用 /api/v5/journal/smartmoney/signal?instCcy=BTC
-        一次调用获取所有数据，不需要逐个查询交易员
+        获取聪明钱共识信号（三层质量对比）
+        并行调用三个筛选层级的signal，对比方向一致性
         """
         result = {
             "smart_money_long_pct": None,
@@ -532,24 +589,47 @@ class SmartMoneyAnalyzer:
             "smart_money_traders_count": None,
             "smart_money_vs1h": None,
             "smart_money_vs24h": None,
+            "smart_money_vs7d": None,
+            "smart_money_net_notional": None,
+            "smart_money_total_notional_vs24h": None,
+            "smart_money_elite_long_pct": None,
+            "smart_money_whale_long_pct": None,
+            "smart_money_avg_long_wr": None,
+            "smart_money_avg_short_wr": None,
+            "smart_money_quality_consensus": None,
+            "smart_money_quality_score": None,
         }
 
         try:
-            signal = OKXRestClient.get_smart_signal(symbol)
-            if not signal:
+            # 并行调用三层信号
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                f_all = pool.submit(OKXRestClient.get_smart_signal, symbol)
+                f_elite = pool.submit(OKXRestClient.get_smart_signal_elite, symbol)
+                f_whale = pool.submit(OKXRestClient.get_smart_signal_whale, symbol)
+
+                signal_all = f_all.result(timeout=12)
+                signal_elite = f_elite.result(timeout=12)
+                signal_whale = f_whale.result(timeout=12)
+
+            if not signal_all:
                 logger.warning(f"SmartMoney signal empty for {symbol}")
                 return result
 
-            # 解析返回数据
-            long_ratio = _to_float(signal.get("longRatio"))
-            short_ratio = _to_float(signal.get("shortRatio"))
-            weighted_long = _to_float(signal.get("weightedLongRatio"))
-            weighted_short = _to_float(signal.get("weightedShortRatio"))
-            vs1h = _to_float(signal.get("vs1h"))
-            vs24h = _to_float(signal.get("vs24h"))
-            long_entry = _to_float(signal.get("smartMoneyLongAvgEntry"))
-            short_entry = _to_float(signal.get("smartMoneyShortAvgEntry"))
-            traders_count = signal.get("tradersWithPosition")
+            # === 解析全量信号 ===
+            long_ratio = _to_float(signal_all.get("longRatio"))
+            short_ratio = _to_float(signal_all.get("shortRatio"))
+            weighted_long = _to_float(signal_all.get("weightedLongRatio"))
+            weighted_short = _to_float(signal_all.get("weightedShortRatio"))
+            vs1h = _to_float(signal_all.get("vs1h"))
+            vs24h = _to_float(signal_all.get("vs24h"))
+            vs7d = _to_float(signal_all.get("vs7d"))
+            long_entry = _to_float(signal_all.get("smartMoneyLongAvgEntry"))
+            short_entry = _to_float(signal_all.get("smartMoneyShortAvgEntry"))
+            traders_count = signal_all.get("tradersWithPosition")
+            net_notional = _to_float(signal_all.get("netNotionalUsdt"))
+            total_notional_vs24h = _to_float(signal_all.get("totalNotionalVs24h"))
+            avg_long_wr = _to_float(signal_all.get("avgLongWinRate"))
+            avg_short_wr = _to_float(signal_all.get("avgShortWinRate"))
 
             result["smart_money_long_pct"] = long_ratio
             result["smart_money_short_pct"] = short_ratio
@@ -560,8 +640,33 @@ class SmartMoneyAnalyzer:
             result["smart_money_traders_count"] = int(traders_count) if traders_count else None
             result["smart_money_vs1h"] = vs1h
             result["smart_money_vs24h"] = vs24h
+            result["smart_money_vs7d"] = vs7d
+            result["smart_money_net_notional"] = net_notional
+            result["smart_money_total_notional_vs24h"] = total_notional_vs24h
+            result["smart_money_avg_long_wr"] = avg_long_wr
+            result["smart_money_avg_short_wr"] = avg_short_wr
 
-            # 判断方向和共识强度（基于加权多方占比）
+            # === 解析高质量信号 ===
+            elite_long = None
+            if signal_elite:
+                elite_long = _to_float(signal_elite.get("weightedLongRatio")) or _to_float(signal_elite.get("longRatio"))
+                result["smart_money_elite_long_pct"] = elite_long
+                # 高质量层的胜率更有参考价值
+                elite_long_wr = _to_float(signal_elite.get("avgLongWinRate"))
+                elite_short_wr = _to_float(signal_elite.get("avgShortWinRate"))
+                if elite_long_wr:
+                    result["smart_money_avg_long_wr"] = elite_long_wr
+                if elite_short_wr:
+                    result["smart_money_avg_short_wr"] = elite_short_wr
+
+            # === 解析大资金信号 ===
+            whale_long = None
+            if signal_whale:
+                whale_long = _to_float(signal_whale.get("weightedLongRatio")) or _to_float(signal_whale.get("longRatio"))
+                result["smart_money_whale_long_pct"] = whale_long
+
+            # === 判断方向和共识强度 ===
+            # 使用加权多方占比作主方向
             ratio = weighted_long if weighted_long is not None else long_ratio
             if ratio is not None:
                 if ratio >= 0.7:
@@ -579,6 +684,45 @@ class SmartMoneyAnalyzer:
                 else:
                     result["smart_money_direction"] = "neutral"
                     result["smart_money_consensus"] = "多空分歧"
+
+            # === 三层信号质量评估 ===
+            dir_all = SmartMoneyAnalyzer._classify_direction(weighted_long or long_ratio)
+            dir_elite = SmartMoneyAnalyzer._classify_direction(elite_long)
+            dir_whale = SmartMoneyAnalyzer._classify_direction(whale_long)
+
+            # 计算一致性
+            directions = [d for d in [dir_all, dir_elite, dir_whale] if d != "unknown"]
+            if len(directions) >= 2:
+                unique = set(directions)
+                if len(unique) == 1 and "neutral" not in unique:
+                    result["smart_money_quality_consensus"] = "strong"
+                elif len(unique) <= 2 and "neutral" in unique:
+                    result["smart_money_quality_consensus"] = "weak"
+                elif dir_whale != "unknown" and dir_whale != dir_all:
+                    result["smart_money_quality_consensus"] = "divergent"  # 大资金反向！
+                else:
+                    result["smart_money_quality_consensus"] = "weak"
+            else:
+                result["smart_money_quality_consensus"] = "unknown"
+
+            # 计算质量评分 (0-1)
+            score = 0.5  # 基础分
+            # 三层一致 +0.3
+            if result["smart_money_quality_consensus"] == "strong":
+                score += 0.3
+            elif result["smart_money_quality_consensus"] == "divergent":
+                score -= 0.3
+            # 高胜率加分
+            if avg_long_wr and avg_long_wr > 0.8:
+                score += 0.1
+            elif avg_short_wr and avg_short_wr > 0.8:
+                score += 0.1
+            # 趋势加强加分（vs24h和vs7d同向）
+            if vs24h is not None and vs7d is not None:
+                if (vs24h > 0 and vs7d > 0) or (vs24h < 0 and vs7d < 0):
+                    score += 0.1  # 趋势持续加强
+            # 限制范围
+            result["smart_money_quality_score"] = max(0.0, min(1.0, score))
 
         except Exception as e:
             logger.error(f"SmartMoney analyze error for {symbol}: {e}")

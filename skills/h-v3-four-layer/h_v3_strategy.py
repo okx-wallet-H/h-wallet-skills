@@ -346,36 +346,81 @@ def score_market_structure(data: Dict) -> float:
 
 def score_smart_money(data: Dict) -> float:
     """
-    聪明钱因子：Top交易员共识方向
+    聪明钱因子：三层信号质量评估
     满分 ±1.0
+    
+    评分维度：
+    1. 全量方向 + 强度 (基础分)
+    2. 三层一致性 (加分/减分)
+    3. 胜率加权 (高胜率方向加分)
+    4. 趋势动量 (持续加强加分)
+    5. 大资金反向警告 (强制降权)
     """
     score = 0.0
 
     direction = data.get("smart_money_direction")
     long_pct = data.get("smart_money_long_pct")
+    quality_consensus = data.get("smart_money_quality_consensus")
+    quality_score = data.get("smart_money_quality_score")
+    elite_long = data.get("smart_money_elite_long_pct")
+    whale_long = data.get("smart_money_whale_long_pct")
+    avg_long_wr = data.get("smart_money_avg_long_wr")
+    avg_short_wr = data.get("smart_money_avg_short_wr")
+    vs24h = data.get("smart_money_vs24h")
+    vs7d = data.get("smart_money_vs7d")
 
     if direction and long_pct is not None:
+        # === 第一层：基础方向分 ===
         if direction == "long":
-            # 根据共识强度给分
             if long_pct >= 0.8:
-                score = 1.0  # 极强共识
+                score = 0.7
             elif long_pct >= 0.7:
-                score = 0.8
+                score = 0.55
             elif long_pct >= 0.6:
-                score = 0.5
+                score = 0.35
             else:
-                score = 0.3
+                score = 0.2
         elif direction == "short":
             short_pct = 1.0 - long_pct
             if short_pct >= 0.8:
-                score = -1.0
+                score = -0.7
             elif short_pct >= 0.7:
-                score = -0.8
+                score = -0.55
             elif short_pct >= 0.6:
-                score = -0.5
+                score = -0.35
             else:
-                score = -0.3
-        # neutral → 0
+                score = -0.2
+
+        # === 第二层：三层一致性修正 ===
+        if quality_consensus == "strong":
+            score *= 1.4  # 三层一致，放大信号
+        elif quality_consensus == "divergent":
+            score *= 0.4  # 大资金反向，强制压缩
+        elif quality_consensus == "weak":
+            score *= 0.8  # 部分一致，略微降权
+
+        # === 第三层：胜率加权 ===
+        if score > 0 and avg_long_wr and avg_long_wr > 0.8:
+            score += 0.1  # 多方高胜率加分
+        elif score < 0 and avg_short_wr and avg_short_wr > 0.8:
+            score -= 0.1  # 空方高胜率加分
+
+        # === 第四层：趋势动量 ===
+        if vs24h is not None and vs7d is not None:
+            if score > 0 and vs24h > 0 and vs7d > 0:
+                score += 0.1  # 多头持续加强
+            elif score < 0 and vs24h < 0 and vs7d < 0:
+                score -= 0.1  # 空头持续加强
+            elif score > 0 and vs24h < -0.1:
+                score -= 0.05  # 多头但趋势转弱
+            elif score < 0 and vs24h > 0.1:
+                score += 0.05  # 空头但趋势转弱
+
+        # === 第五层：大资金反向警告 ===
+        if whale_long is not None and direction == "long" and whale_long < 0.35:
+            score *= 0.5  # 全量看多但大资金看空，危险！
+        elif whale_long is not None and direction == "short" and whale_long > 0.65:
+            score *= 0.5  # 全量看空但大资金看多，危险！
 
     return _clamp(score, -1.0, 1.0)
 
@@ -520,12 +565,28 @@ class StrategyEngine:
             "rsi": data.get("rsi_14"),
             "macd_hist": data.get("macd_hist"),
             "supertrend": data.get("supertrend_direction"),
+            "ema_5": data.get("ema_5"),
+            "ema_20": data.get("ema_20"),
             "funding_rate": data.get("funding_rate"),
-            "smart_money": data.get("smart_money_consensus"),
             "long_ratio": data.get("long_ratio"),
             "oi_change": data.get("oi_change_pct"),
             "tf_1h": data.get("tf_1h", {}).get("direction"),
             "tf_1d": data.get("tf_1d", {}).get("direction"),
+            # 聪明钱三层质量
+            "smart_money": data.get("smart_money_consensus"),
+            "sm_quality": data.get("smart_money_quality_consensus"),  # strong/weak/divergent
+            "sm_quality_score": data.get("smart_money_quality_score"),
+            "sm_all_long": data.get("smart_money_weighted_long"),
+            "sm_elite_long": data.get("smart_money_elite_long_pct"),
+            "sm_whale_long": data.get("smart_money_whale_long_pct"),
+            "sm_long_wr": data.get("smart_money_avg_long_wr"),
+            "sm_short_wr": data.get("smart_money_avg_short_wr"),
+            "sm_vs24h": data.get("smart_money_vs24h"),
+            "sm_vs7d": data.get("smart_money_vs7d"),
+            "sm_net_notional": data.get("smart_money_net_notional"),
+            "sm_long_entry": data.get("smart_money_long_entry"),
+            "sm_short_entry": data.get("smart_money_short_entry"),
+            "sm_traders": data.get("smart_money_traders_count"),
         }
 
         return Signal(
