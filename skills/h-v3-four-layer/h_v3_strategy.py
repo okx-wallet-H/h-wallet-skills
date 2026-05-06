@@ -122,9 +122,9 @@ def score_trend(data: Dict) -> float:
     st_dir = data.get("supertrend_direction")
     if st_dir:
         count += 1
-        if st_dir == "UP":
+        if st_dir in ("UP", "buy"):
             score += 0.6
-        elif st_dir == "DOWN":
+        elif st_dir in ("DOWN", "sell"):
             score -= 0.6
 
     # 价格 vs VWAP (权重40%)
@@ -619,7 +619,7 @@ if __name__ == "__main__":
         "bb_lower": 77514.7,
         "atr_14": 882.9,
         "supertrend_value": 78627.4,
-        "supertrend_direction": "UP",
+        "supertrend_direction": "buy",
         "vwap": 80115.6,
         "cmf": 0.10,
         "obv": 14021253,

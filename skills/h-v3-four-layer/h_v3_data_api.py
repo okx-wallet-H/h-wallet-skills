@@ -9,19 +9,23 @@ H V3 数据接口层 (Data API Layer)
 3. 后台持续拉数据存缓存，用户请求时秒回
 4. 任何单个命令失败不阻塞，使用上次有效数据（容错降级）
 
-数据源：OKX Agent Trade Kit CLI v1.3.2
-- okx-cex-market: 行情数据（价格、K线、盘口、资金费率、技术指标）- 无需鉴权
-- okx-cex-smartmoney: 聪明钱（交易员排行榜、意见信号、持仓分析）- 需鉴权
+数据源：
+- okx-cex-market (CLI): 行情数据（价格、K线、盘口、资金费率、技术指标）- 无需鉴权
+- OKX V5 REST API: 聪明钱（signal/overview）- 需鉴权（绕过CLI bug）
 """
 
 import json
 import subprocess
 import time
+import hmac
+import hashlib
+import base64
 import threading
 import logging
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Any, List
-from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from copy import deepcopy
 
 # ============================================================
@@ -36,12 +40,30 @@ REFRESH_INTERVAL = 300  # 后台刷新间隔5分钟
 CLI_TIMEOUT = 10  # 单个CLI命令超时10秒
 MAX_WORKERS = 12  # 并行线程数
 
+# OKX V5 API 配置（用于聪明钱，绕过CLI bug）
+OKX_API_KEY = '6265ca38-5ede-4c96-9c06-63660bd927ea'
+OKX_SECRET_KEY = 'A17AEBF701FE326D15BED7B02EB3DED7'
+OKX_PASSPHRASE = 'Yy133678.'
+OKX_BASE_URL = 'https://www.okx.com'
+
 # 技术指标列表（OKX CLI支持的）
 INDICATORS = [
     "rsi", "macd", "bb", "atr", "supertrend",
     "vwap", "cmf", "obv", "kdj", "stoch-rsi", "mfi",
-    "top-long-short"
+    "top-long-short", "ema"
 ]
+
+# EMA 需要特殊参数（注意：supertrend不能传params，传了返回空）
+INDICATOR_PARAMS = {
+    "ema": "5,20",
+    "rsi": "14",
+    "macd": "12,26,9",
+    "bb": "20,2",
+    "kdj": "9,3,3",
+}
+
+# 某些指标在SWAP上返回空，需要用现货instId
+INDICATORS_USE_SPOT = {"supertrend", "ema"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,22 +73,23 @@ logger = logging.getLogger("h_v3_data_api")
 
 
 # ============================================================
-# 标准输出格式定义
+# 标准数据格式定义
 # ============================================================
 
 def empty_standard_data(symbol: str) -> Dict[str, Any]:
-    """返回标准格式的空数据结构，引擎只认这个格式"""
+    """返回空的标准格式数据结构"""
     return {
-        "symbol": symbol,
-        "inst_id": f"{symbol}-USDT-SWAP",
-        "timestamp": int(time.time()),
+        "symbol": symbol.upper(),
+        "timestamp": 0,
+
+        # 价格
         "price": None,
         "price_open": None,
         "price_high": None,
         "price_low": None,
         "volume_24h": None,
 
-        # 技术指标（来自OKX CLI okx-cex-market）
+        # 技术指标
         "rsi_14": None,
         "macd_dif": None,
         "macd_dea": None,
@@ -76,7 +99,7 @@ def empty_standard_data(symbol: str) -> Dict[str, Any]:
         "bb_lower": None,
         "atr_14": None,
         "supertrend_value": None,
-        "supertrend_direction": None,  # "UP" or "DOWN"
+        "supertrend_direction": None,  # "buy" / "sell"
         "vwap": None,
         "cmf": None,
         "obv": None,
@@ -88,6 +111,8 @@ def empty_standard_data(symbol: str) -> Dict[str, Any]:
         "stoch_rsi_k": None,
         "stoch_rsi_d": None,
         "mfi": None,
+        "ema_5": None,
+        "ema_20": None,
 
         # 市场微观结构
         "funding_rate": None,
@@ -98,12 +123,18 @@ def empty_standard_data(symbol: str) -> Dict[str, Any]:
         "short_ratio": None,
         "long_short_ratio": None,
 
-        # 聪明钱（来自OKX CLI okx-cex-smartmoney）
+        # 聪明钱（来自OKX V5 REST API）
         "smart_money_long_pct": None,
         "smart_money_short_pct": None,
+        "smart_money_weighted_long": None,
+        "smart_money_weighted_short": None,
         "smart_money_direction": None,  # "long" / "short" / "neutral"
         "smart_money_consensus": None,  # 中文描述
-        "smart_money_top_traders": None,  # Top交易员列表
+        "smart_money_long_entry": None,  # 多方平均入场价
+        "smart_money_short_entry": None,  # 空方平均入场价
+        "smart_money_traders_count": None,  # 持仓交易员数
+        "smart_money_vs1h": None,
+        "smart_money_vs24h": None,
 
         # 多时间框架方向（由多TF指标综合判断）
         "tf_1h": {},
@@ -111,15 +142,90 @@ def empty_standard_data(symbol: str) -> Dict[str, Any]:
         "tf_1d": {},
 
         # 元数据
-        "data_source": "okx_cli",
-        "data_version": "v3.1",
+        "data_source": "okx_cli+v5api",
+        "data_version": "v3.2",
         "fetch_time_ms": 0,
         "errors": [],
     }
 
 
 # ============================================================
-# OKX CLI 命令执行器
+# OKX V5 REST API 客户端（用于聪明钱）
+# ============================================================
+
+class OKXRestClient:
+    """直接调用OKX V5 REST API，绕过CLI的smartmoney bug"""
+
+    @staticmethod
+    def _sign(timestamp: str, method: str, request_path: str, body: str = '') -> str:
+        message = timestamp + method + request_path + body
+        mac = hmac.new(OKX_SECRET_KEY.encode(), message.encode(), hashlib.sha256)
+        return base64.b64encode(mac.digest()).decode()
+
+    @staticmethod
+    def _get_headers(method: str, request_path: str, body: str = '') -> Dict:
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
+        sign = OKXRestClient._sign(timestamp, method, request_path, body)
+        return {
+            'OK-ACCESS-KEY': OKX_API_KEY,
+            'OK-ACCESS-SIGN': sign,
+            'OK-ACCESS-TIMESTAMP': timestamp,
+            'OK-ACCESS-PASSPHRASE': OKX_PASSPHRASE,
+            'Content-Type': 'application/json'
+        }
+
+    @staticmethod
+    def api_get(path: str, timeout: int = 10) -> Optional[Dict]:
+        """发送GET请求到OKX V5 API"""
+        try:
+            headers = OKXRestClient._get_headers('GET', path)
+            resp = requests.get(OKX_BASE_URL + path, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('code') == '0':
+                    return data.get('data')
+                else:
+                    logger.warning(f"OKX API error [{path[:50]}]: code={data.get('code')} msg={data.get('msg')}")
+                    return None
+            else:
+                logger.warning(f"OKX API HTTP {resp.status_code} [{path[:50]}]")
+                return None
+        except requests.Timeout:
+            logger.warning(f"OKX API timeout [{path[:50]}]")
+            return None
+        except Exception as e:
+            logger.error(f"OKX API exception [{path[:50]}]: {e}")
+            return None
+
+    @staticmethod
+    def get_smart_signal(inst_ccy: str) -> Optional[Dict]:
+        """
+        获取单币种聪明钱共识信号
+        API: /api/v5/journal/smartmoney/signal?instCcy=BTC
+        返回: longRatio, shortRatio, weightedLongRatio, vs1h, vs24h, 
+              smartMoneyLongAvgEntry, smartMoneyShortAvgEntry 等
+        """
+        path = f'/api/v5/journal/smartmoney/signal?instCcy={inst_ccy}'
+        data = OKXRestClient.api_get(path)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def get_smart_overview(top_n: int = 20) -> Optional[List]:
+        """
+        获取多币种聪明钱总览
+        API: /api/v5/journal/smartmoney/overview?topInstruments=20
+        """
+        path = f'/api/v5/journal/smartmoney/overview?topInstruments={top_n}'
+        data = OKXRestClient.api_get(path)
+        if data and isinstance(data, list):
+            return data
+        return None
+
+
+# ============================================================
+# OKX CLI 命令执行器（用于技术指标和行情）
 # ============================================================
 
 class OKXCliExecutor:
@@ -152,7 +258,14 @@ class OKXCliExecutor:
     @staticmethod
     def get_indicator(inst_id: str, indicator: str, bar: str = "4H") -> Optional[Dict]:
         """获取单个技术指标"""
-        cmd = f"okx market indicator {indicator} {inst_id} --bar {bar} --json"
+        # 某些指标需要用现货instId（SWAP上返回空）
+        actual_inst_id = inst_id
+        if indicator in INDICATORS_USE_SPOT and inst_id.endswith("-SWAP"):
+            actual_inst_id = inst_id.replace("-SWAP", "")
+        # 构建命令，包含params参数
+        params_str = INDICATOR_PARAMS.get(indicator, "")
+        params_arg = f" --params {params_str}" if params_str else ""
+        cmd = f"okx market indicator {indicator} {actual_inst_id} --bar {bar}{params_arg} --json"
         data = OKXCliExecutor.run(cmd)
         if not data or not isinstance(data, list) or len(data) == 0:
             return None
@@ -160,12 +273,20 @@ class OKXCliExecutor:
             indicators = data[0]["data"][0]["timeframes"][bar]["indicators"]
             # 指标名称大写
             key = indicator.upper().replace("-", "")
-            if key == "STOCHRSI":
-                key = "STOCHRSI"
-            elif key == "TOPLONGSHORT":
-                key = "TOPLONGSHORT"
+            # 特殊映射
+            key_map = {
+                "STOCHRSI": "STOCHRSI",
+                "TOPLONGSHORT": "TOPLONGSHORT",
+                "BB": "BB",
+            }
+            key = key_map.get(key, key)
             if key in indicators and len(indicators[key]) > 0:
                 return indicators[key][0].get("values", {})
+            # 尝试小写
+            for k in indicators:
+                if k.upper() == key:
+                    if len(indicators[k]) > 0:
+                        return indicators[k][0].get("values", {})
             return None
         except (KeyError, IndexError, TypeError):
             return None
@@ -203,27 +324,6 @@ class OKXCliExecutor:
             return None
         return data[:limit]
 
-    @staticmethod
-    def get_smart_traders(limit: int = 10) -> Optional[List]:
-        """获取Top交易员列表"""
-        cmd = f"okx smartmoney traders --limit {limit} --json"
-        data = OKXCliExecutor.run(cmd, timeout=15)
-        if not data or not isinstance(data, list):
-            return None
-        return data
-
-    @staticmethod
-    def get_trader_detail(author_id: str) -> Optional[Dict]:
-        """获取交易员详情和持仓"""
-        cmd = f"okx smartmoney trader --authorId {author_id} --json"
-        data = OKXCliExecutor.run(cmd, timeout=15)
-        if not data or not isinstance(data, dict):
-            # 有时返回的是列表
-            if isinstance(data, list) and len(data) > 0:
-                return data[0] if isinstance(data[0], dict) else None
-            return None
-        return data
-
 
 # ============================================================
 # 数据解析器：将OKX CLI原始数据映射到标准格式
@@ -236,7 +336,9 @@ class DataParser:
     def parse_rsi(raw: Optional[Dict]) -> Dict:
         if not raw:
             return {}
-        return {"rsi_14": _to_float(raw.get("14"))}
+        # 可能返回 {"14": "65.7"} 或 {"rsi": "65.7"}
+        val = raw.get("14") or raw.get("rsi")
+        return {"rsi_14": _to_float(val)}
 
     @staticmethod
     def parse_macd(raw: Optional[Dict]) -> Dict:
@@ -262,15 +364,30 @@ class DataParser:
     def parse_atr(raw: Optional[Dict]) -> Dict:
         if not raw:
             return {}
-        return {"atr_14": _to_float(raw.get("14"))}
+        # 可能返回 {"14": "1234"} 或 {"atr": "1234"}
+        val = raw.get("14") or raw.get("atr")
+        return {"atr_14": _to_float(val)}
 
     @staticmethod
     def parse_supertrend(raw: Optional[Dict]) -> Dict:
         if not raw:
             return {}
+        # API实际返回: direction="-1"/"1", trend="UP"/"DOWN"
+        # direction: -1=上涨趋势(buy), 1=下跌趋势(sell)
+        # trend: "UP"=买入信号, "DOWN"=卖出信号
+        trend = raw.get("trend", "").upper()
+        dir_val = raw.get("direction", "")
+        
+        if trend == "UP" or str(dir_val) == "-1":
+            direction = "buy"
+        elif trend == "DOWN" or str(dir_val) == "1":
+            direction = "sell"
+        else:
+            direction = None
+        
         return {
-            "supertrend_value": _to_float(raw.get("superTrend")),
-            "supertrend_direction": raw.get("trend"),  # "UP" or "DOWN"
+            "supertrend_value": _to_float(raw.get("superTrend") or raw.get("supertrend") or raw.get("lowerBand")),
+            "supertrend_direction": direction,
         }
 
     @staticmethod
@@ -290,8 +407,8 @@ class DataParser:
         if not raw:
             return {}
         return {
-            "obv": _to_float(raw.get("value")),
-            "obv_ma": _to_float(raw.get("maObv")),
+            "obv": _to_float(raw.get("value") or raw.get("obv")),
+            "obv_ma": _to_float(raw.get("maObv") or raw.get("ma")),
         }
 
     @staticmethod
@@ -309,7 +426,7 @@ class DataParser:
         if not raw:
             return {}
         return {
-            "stoch_rsi": _to_float(raw.get("stochRsi")),
+            "stoch_rsi": _to_float(raw.get("stochRsi") or raw.get("stochrsi")),
             "stoch_rsi_k": _to_float(raw.get("k")),
             "stoch_rsi_d": _to_float(raw.get("d")),
         }
@@ -319,6 +436,16 @@ class DataParser:
         if not raw:
             return {}
         return {"mfi": _to_float(raw.get("mfi"))}
+
+    @staticmethod
+    def parse_ema(raw: Optional[Dict]) -> Dict:
+        """解析EMA指标 - 返回 {"5": "81144.2", "20": "80033.5"}"""
+        if not raw:
+            return {}
+        return {
+            "ema_5": _to_float(raw.get("5") or raw.get("ema5")),
+            "ema_20": _to_float(raw.get("20") or raw.get("ema20")),
+        }
 
     @staticmethod
     def parse_top_long_short(raw: Optional[Dict]) -> Dict:
@@ -374,106 +501,87 @@ class DataParser:
         "kdj": "parse_kdj",
         "stoch-rsi": "parse_stoch_rsi",
         "mfi": "parse_mfi",
+        "ema": "parse_ema",
         "top-long-short": "parse_top_long_short",
     }
 
 
 # ============================================================
-# 聪明钱分析器
+# 聪明钱分析器（使用V5 REST API）
 # ============================================================
 
 class SmartMoneyAnalyzer:
-    """分析Top交易员持仓，计算聪明钱共识方向"""
+    """通过OKX V5 REST API获取聪明钱共识信号"""
 
     @staticmethod
-    def analyze(traders_data: Optional[List], symbol: str = "BTC") -> Dict:
+    def analyze(symbol: str = "BTC") -> Dict:
         """
-        分析Top交易员对特定币种的多空方向
-        返回标准格式的聪明钱数据
+        获取聪明钱共识信号
+        直接调用 /api/v5/journal/smartmoney/signal?instCcy=BTC
+        一次调用获取所有数据，不需要逐个查询交易员
         """
         result = {
             "smart_money_long_pct": None,
             "smart_money_short_pct": None,
+            "smart_money_weighted_long": None,
+            "smart_money_weighted_short": None,
             "smart_money_direction": None,
             "smart_money_consensus": None,
-            "smart_money_top_traders": None,
+            "smart_money_long_entry": None,
+            "smart_money_short_entry": None,
+            "smart_money_traders_count": None,
+            "smart_money_vs1h": None,
+            "smart_money_vs24h": None,
         }
 
-        if not traders_data:
-            return result
+        try:
+            signal = OKXRestClient.get_smart_signal(symbol)
+            if not signal:
+                logger.warning(f"SmartMoney signal empty for {symbol}")
+                return result
 
-        # 获取每个交易员的持仓方向
-        long_count = 0
-        short_count = 0
-        total_with_position = 0
-        trader_summaries = []
+            # 解析返回数据
+            long_ratio = _to_float(signal.get("longRatio"))
+            short_ratio = _to_float(signal.get("shortRatio"))
+            weighted_long = _to_float(signal.get("weightedLongRatio"))
+            weighted_short = _to_float(signal.get("weightedShortRatio"))
+            vs1h = _to_float(signal.get("vs1h"))
+            vs24h = _to_float(signal.get("vs24h"))
+            long_entry = _to_float(signal.get("smartMoneyLongAvgEntry"))
+            short_entry = _to_float(signal.get("smartMoneyShortAvgEntry"))
+            traders_count = signal.get("tradersWithPosition")
 
-        for trader in traders_data[:10]:
-            author_id = trader.get("authorId", "")
-            nick = trader.get("nickName", "Unknown")
-            pnl = trader.get("pnl", "0")
+            result["smart_money_long_pct"] = long_ratio
+            result["smart_money_short_pct"] = short_ratio
+            result["smart_money_weighted_long"] = weighted_long
+            result["smart_money_weighted_short"] = weighted_short
+            result["smart_money_long_entry"] = long_entry
+            result["smart_money_short_entry"] = short_entry
+            result["smart_money_traders_count"] = int(traders_count) if traders_count else None
+            result["smart_money_vs1h"] = vs1h
+            result["smart_money_vs24h"] = vs24h
 
-            # 获取交易员详情（含持仓）
-            detail = OKXCliExecutor.get_trader_detail(author_id)
-            if not detail:
-                continue
+            # 判断方向和共识强度（基于加权多方占比）
+            ratio = weighted_long if weighted_long is not None else long_ratio
+            if ratio is not None:
+                if ratio >= 0.7:
+                    result["smart_money_direction"] = "long"
+                    result["smart_money_consensus"] = "强共识做多"
+                elif ratio >= 0.55:
+                    result["smart_money_direction"] = "long"
+                    result["smart_money_consensus"] = "中共识做多"
+                elif ratio <= 0.3:
+                    result["smart_money_direction"] = "short"
+                    result["smart_money_consensus"] = "强共识做空"
+                elif ratio <= 0.45:
+                    result["smart_money_direction"] = "short"
+                    result["smart_money_consensus"] = "中共识做空"
+                else:
+                    result["smart_money_direction"] = "neutral"
+                    result["smart_money_consensus"] = "多空分歧"
 
-            # 分析持仓
-            positions = detail.get("positions", [])
-            if not positions and isinstance(detail, dict):
-                # 有时候结构不同，尝试其他路径
-                positions = detail.get("currentPositions", [])
-
-            trader_direction = None
-            for pos in (positions if isinstance(positions, list) else []):
-                inst = pos.get("instId", "")
-                if symbol.upper() in inst.upper():
-                    side = pos.get("posSide", "").lower()
-                    if side == "long":
-                        long_count += 1
-                        trader_direction = "long"
-                    elif side == "short":
-                        short_count += 1
-                        trader_direction = "short"
-                    total_with_position += 1
-                    break
-
-            trader_summaries.append({
-                "nick": nick,
-                "pnl": pnl,
-                "direction": trader_direction,
-            })
-
-        # 计算共识
-        if total_with_position > 0:
-            long_pct = long_count / total_with_position
-            short_pct = short_count / total_with_position
-        else:
-            long_pct = 0.5
-            short_pct = 0.5
-
-        # 判断方向和共识强度
-        if long_pct >= 0.7:
-            direction = "long"
-            consensus = "强共识做多"
-        elif long_pct >= 0.55:
-            direction = "long"
-            consensus = "中共识做多"
-        elif short_pct >= 0.7:
-            direction = "short"
-            consensus = "强共识做空"
-        elif short_pct >= 0.55:
-            direction = "short"
-            consensus = "中共识做空"
-        else:
-            direction = "neutral"
-            consensus = "多空分歧"
-
-        result["smart_money_long_pct"] = round(long_pct, 3)
-        result["smart_money_short_pct"] = round(short_pct, 3)
-        result["smart_money_direction"] = direction
-        result["smart_money_consensus"] = consensus
-        result["smart_money_top_traders"] = trader_summaries[:5]
+        except Exception as e:
+            logger.error(f"SmartMoney analyze error for {symbol}: {e}")
 
         return result
 
@@ -483,7 +591,7 @@ class SmartMoneyAnalyzer:
 # ============================================================
 
 class DataAggregator:
-    """并行调用所有OKX CLI命令，聚合成标准格式"""
+    """并行调用所有OKX CLI命令+V5 API，聚合成标准格式"""
 
     def __init__(self, max_workers: int = MAX_WORKERS):
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -492,12 +600,12 @@ class DataAggregator:
                    include_smart_money: bool = True) -> Dict[str, Any]:
         """
         并行拉取一个币种的全部数据，返回标准格式
-        
+
         Args:
             symbol: 币种名称 (BTC/ETH/SOL/DOGE/OKB)
             timeframe: 时间框架 (1H/4H/1Dutc)
-            include_smart_money: 是否包含聪明钱数据（耗时较长）
-        
+            include_smart_money: 是否包含聪明钱数据
+
         Returns:
             标准格式数据字典
         """
@@ -530,10 +638,10 @@ class DataAggregator:
             OKXCliExecutor.get_oi_history, inst_id
         )
 
-        # 5. 聪明钱（可选，耗时较长）
+        # 5. 聪明钱（V5 REST API，一次调用）
         if include_smart_money:
-            futures["smart_traders"] = self.executor.submit(
-                OKXCliExecutor.get_smart_traders, 10
+            futures["smart_signal"] = self.executor.submit(
+                SmartMoneyAnalyzer.analyze, symbol
             )
 
         # 收集结果
@@ -571,9 +679,9 @@ class DataAggregator:
 
         # 解析聪明钱
         if include_smart_money:
-            traders_raw = results.get("smart_traders")
-            smart_data = SmartMoneyAnalyzer.analyze(traders_raw, symbol)
-            data.update(smart_data)
+            smart_data = results.get("smart_signal")
+            if smart_data:
+                data.update(smart_data)
 
         # 元数据
         data["timestamp"] = int(time.time())
@@ -598,7 +706,7 @@ class DataAggregator:
             # 并行拉取关键指标
             tf_futures = {}
             inst_id = f"{symbol}-USDT-SWAP"
-            for ind in ["rsi", "macd", "supertrend"]:
+            for ind in ["rsi", "macd", "supertrend", "ema"]:
                 tf_futures[ind] = self.executor.submit(
                     OKXCliExecutor.get_indicator, inst_id, ind, tf
                 )
@@ -663,15 +771,7 @@ class CacheManager:
         logger.info("CacheManager stopped")
 
     def get(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """
-        获取缓存数据（秒回）
-        
-        Args:
-            symbol: 币种名称
-            
-        Returns:
-            标准格式数据字典，或None（首次启动未完成刷新时）
-        """
+        """获取缓存数据（秒回）"""
         with self._lock:
             cached = self._cache.get(symbol.upper())
             if cached:
@@ -733,16 +833,16 @@ class CacheManager:
                         self._cache[symbol.upper()] = data
                         self._cache_time[symbol.upper()] = time.time()
                     logger.info(
-                        "✓ %s refreshed: price=%.1f, RSI=%.1f, fetch=%dms",
+                        "✓ %s refreshed: price=%.1f, RSI=%.1f, EMA5=%.1f, SM=%s, fetch=%dms",
                         symbol, data["price"] or 0,
                         data.get("rsi_14") or 0,
+                        data.get("ema_5") or 0,
+                        data.get("smart_money_consensus") or "N/A",
                         data.get("fetch_time_ms", 0)
                     )
                 elif data:
-                    # 价格为空但有其他数据，也更新（可能K线延迟）
                     with self._lock:
                         old = self._cache.get(symbol.upper(), {})
-                        # 保留旧价格
                         if old.get("price"):
                             data["price"] = old["price"]
                         self._cache[symbol.upper()] = data
@@ -765,7 +865,7 @@ _cache_manager: Optional[CacheManager] = None
 def init(symbols: List[str] = None):
     """
     初始化数据接口层，启动后台缓存
-    
+
     Args:
         symbols: 监控币种列表，默认 ["BTC", "ETH", "SOL", "DOGE", "OKB"]
     """
@@ -779,15 +879,9 @@ def init(symbols: List[str] = None):
 def get_data(symbol: str) -> Optional[Dict[str, Any]]:
     """
     获取标准格式数据（秒回，从缓存读取）
-    
+
     这是策略引擎的唯一数据入口。
     引擎不需要知道数据从哪来，只需要调用这个函数。
-    
-    Args:
-        symbol: 币种名称 (BTC/ETH/SOL等)
-        
-    Returns:
-        标准格式数据字典，包含所有技术指标、市场微观结构、聪明钱数据
     """
     if _cache_manager is None:
         logger.error("DataAPI not initialized! Call init() first.")
@@ -841,14 +935,17 @@ def _to_float(val) -> Optional[float]:
 def _judge_tf_direction(tf_data: Dict) -> str:
     """
     根据时间框架的关键指标判断方向
-    RSI > 55 且 MACD DIF > DEA 且 SuperTrend UP → long
-    RSI < 45 且 MACD DIF < DEA 且 SuperTrend DOWN → short
+    RSI > 55 且 MACD DIF > DEA 且 SuperTrend buy → long
+    RSI < 45 且 MACD DIF < DEA 且 SuperTrend sell → short
+    EMA5 > EMA20 → bullish加分
     其他 → neutral
     """
     rsi = tf_data.get("rsi_14")
     macd_dif = tf_data.get("macd_dif")
     macd_dea = tf_data.get("macd_dea")
     st_dir = tf_data.get("supertrend_direction")
+    ema5 = tf_data.get("ema_5")
+    ema20 = tf_data.get("ema_20")
 
     bullish_count = 0
     bearish_count = 0
@@ -866,12 +963,22 @@ def _judge_tf_direction(tf_data: Dict) -> str:
             bearish_count += 1
 
     if st_dir:
-        if st_dir == "UP":
+        if st_dir == "buy":
             bullish_count += 1
-        elif st_dir == "DOWN":
+        elif st_dir == "sell":
             bearish_count += 1
 
-    if bullish_count >= 2:
+    if ema5 is not None and ema20 is not None:
+        if ema5 > ema20:
+            bullish_count += 1
+        else:
+            bearish_count += 1
+
+    if bullish_count >= 3:
+        return "long"
+    elif bearish_count >= 3:
+        return "short"
+    elif bullish_count >= 2:
         return "long"
     elif bearish_count >= 2:
         return "short"
@@ -886,7 +993,7 @@ if __name__ == "__main__":
     import sys
 
     print("=" * 60)
-    print("H V3 数据接口层 - 独立测试")
+    print("H V3 数据接口层 v3.2 - 独立测试")
     print("=" * 60)
 
     # 单次拉取测试
@@ -896,13 +1003,14 @@ if __name__ == "__main__":
     aggregator = DataAggregator()
     data = aggregator.fetch_multi_timeframe(symbol)
 
-    print(f"\n--- {symbol} 标准格式数据 ---")
+    print(f"\n--- {symbol} 标准格式数据 (v3.2) ---")
     print(f"价格: {data.get('price')}")
     print(f"RSI(14): {data.get('rsi_14')}")
     print(f"MACD: DIF={data.get('macd_dif')} DEA={data.get('macd_dea')} HIST={data.get('macd_hist')}")
     print(f"BB: Upper={data.get('bb_upper')} Mid={data.get('bb_middle')} Lower={data.get('bb_lower')}")
     print(f"ATR(14): {data.get('atr_14')}")
     print(f"SuperTrend: {data.get('supertrend_value')} ({data.get('supertrend_direction')})")
+    print(f"EMA: EMA5={data.get('ema_5')} EMA20={data.get('ema_20')}")
     print(f"VWAP: {data.get('vwap')}")
     print(f"CMF: {data.get('cmf')}")
     print(f"OBV: {data.get('obv')} (MA: {data.get('obv_ma')})")
@@ -913,9 +1021,19 @@ if __name__ == "__main__":
     print(f"持仓量: ${data.get('oi_usd'):,.0f}" if data.get('oi_usd') else "持仓量: N/A")
     print(f"OI变化: {data.get('oi_change_pct')}%")
     print(f"多空比: Long={data.get('long_ratio')} Short={data.get('short_ratio')}")
-    print(f"聪明钱: {data.get('smart_money_consensus')} (多{data.get('smart_money_long_pct')})")
-    print(f"多TF: 1H={data.get('tf_1h', {}).get('direction')} 4H方向=基于主数据 1D={data.get('tf_1d', {}).get('direction')}")
-    print(f"耗时: {data.get('fetch_time_ms')}ms")
+    print(f"\n--- 聪明钱 (V5 REST API) ---")
+    print(f"聪明钱方向: {data.get('smart_money_consensus')} ({data.get('smart_money_direction')})")
+    print(f"多方占比: {data.get('smart_money_long_pct')}")
+    print(f"加权多方: {data.get('smart_money_weighted_long')}")
+    print(f"多方入场价: {data.get('smart_money_long_entry')}")
+    print(f"空方入场价: {data.get('smart_money_short_entry')}")
+    print(f"持仓交易员: {data.get('smart_money_traders_count')}")
+    print(f"1h变化: {data.get('smart_money_vs1h')}")
+    print(f"24h变化: {data.get('smart_money_vs24h')}")
+    print(f"\n--- 多时间框架 ---")
+    print(f"1H: {data.get('tf_1h', {}).get('direction')} (EMA5={data.get('tf_1h', {}).get('ema_5')})")
+    print(f"1D: {data.get('tf_1d', {}).get('direction')} (EMA5={data.get('tf_1d', {}).get('ema_5')})")
+    print(f"\n耗时: {data.get('fetch_time_ms')}ms")
     print(f"错误: {data.get('errors')}")
     print(f"数据源: {data.get('data_source')}")
 
